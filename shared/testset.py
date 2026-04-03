@@ -88,3 +88,43 @@ ALL_PAIRS = (
     [(TASK_EN_VI, src, ref) for src, ref in EN_VI] +
     [(TASK_VI_EN, src, ref) for src, ref in VI_EN]
 )
+
+
+def load_phomt(n_samples: int = 200, split: str = "test",
+               seed: int = 42) -> list:
+    """
+    Load sentence pairs from ura-hcmut/PhoMT (HuggingFace).
+
+    Returns a flat list of (task_id, source, reference) tuples with
+    n_samples // 2 EN→VI pairs and n_samples // 2 VI→EN pairs drawn
+    from the requested split.
+
+    Args:
+        n_samples: total pairs to return (split evenly between directions).
+        split:     HuggingFace dataset split — "test", "validation", or "train".
+        seed:      random seed for reproducible sampling.
+    """
+    from datasets import load_dataset
+    import random
+
+    ds = load_dataset("ura-hcmut/PhoMT", split=split)
+
+    rng = random.Random(seed)
+    indices = list(range(len(ds)))
+    rng.shuffle(indices)
+
+    half = n_samples // 2
+    selected = indices[:half * 2]
+
+    en_vi_idx = selected[:half]
+    vi_en_idx = selected[half:]
+
+    pairs = []
+    for i in en_vi_idx:
+        row = ds[i]
+        pairs.append((TASK_EN_VI, row["en"], row["vi"]))
+    for i in vi_en_idx:
+        row = ds[i]
+        pairs.append((TASK_VI_EN, row["vi"], row["en"]))
+
+    return pairs

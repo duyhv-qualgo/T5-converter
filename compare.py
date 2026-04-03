@@ -1,21 +1,19 @@
 """
 Cross-format benchmark: ONNX FP32 vs LiteRT Explicit FP32 vs LiteRT Stateful FP32.
 
-Compares accuracy (BLEU-4, chrF++, exact match) and latency across all three
-export formats on the shared 60-pair test set.
+Compares accuracy (BLEU-4, chrF++, exact match) and latency across all export
+formats on the shared 60-pair test set or PhoMT.
 
 Requirements:
   - ONNX models exported via onnx/export.py
   - LiteRT explicit models converted via litert/explicit/convert.py
   - LiteRT stateful models converted via litert/stateful/convert.py
 
-Both litert/.venv and onnx/.venv have different deps (litert-torch vs optimum).
-This script requires BOTH to be installed in the same environment, OR run each
-subset separately with --only-onnx / --only-litert.
+Each track uses a separate venv with incompatible deps.  Run subsets separately:
+  --only-onnx / --only-litert
 
-Alternatively: activate litert/.venv (which has ai-edge-litert) and install
-onnxruntime manually:
-  source litert/.venv/bin/activate
+Alternatively: activate one venv and install the other runtimes manually, e.g.:
+  source litert/explicit/.venv/bin/activate
   pip install onnxruntime
 
 Usage:
@@ -23,6 +21,8 @@ Usage:
   python compare.py --only-onnx
   python compare.py --only-litert
   python compare.py --verbose
+  python compare.py --phomt
+  python compare.py --phomt --n-samples 500
 """
 
 import argparse
@@ -34,7 +34,7 @@ import numpy as np
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
-from shared.testset import ALL_PAIRS, TASK_EN_VI, TASK_VI_EN
+from shared.testset import ALL_PAIRS, TASK_EN_VI, TASK_VI_EN, load_phomt
 from shared.metrics import compute_metrics_split, print_results_table
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ def make_onnx_inputs(tokenizer, text: str, task_id: int):
     ids = [task_id] + tokenizer.encode(text, add_special_tokens=False)
     if ids[-1] != EOS_ID:
         ids.append(EOS_ID)
-    input_ids    = np.array([ids], dtype=np.int64)
+    input_ids      = np.array([ids], dtype=np.int64)
     attention_mask = np.ones_like(input_ids, dtype=np.int64)
     return input_ids, attention_mask
 
@@ -131,9 +131,9 @@ def _load_onnx(onnx_dir: Path, num_threads: int = 4):
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opts.inter_op_num_threads = num_threads
     opts.intra_op_num_threads = num_threads
-    enc = ort.InferenceSession(str(onnx_dir / "encoder_model.onnx"),             opts)
-    dec = ort.InferenceSession(str(onnx_dir / "decoder_model.onnx"),              opts)
-    dwp = ort.InferenceSession(str(onnx_dir / "decoder_with_past_model.onnx"),    opts)
+    enc = ort.InferenceSession(str(onnx_dir / "encoder_model.onnx"),          opts)
+    dec = ort.InferenceSession(str(onnx_dir / "decoder_model.onnx"),           opts)
+    dwp = ort.InferenceSession(str(onnx_dir / "decoder_with_past_model.onnx"), opts)
     return enc, dec, dwp
 
 
@@ -207,9 +207,20 @@ def main():
     parser.add_argument("--only-litert", action="store_true")
     parser.add_argument("--verbose",     action="store_true")
     parser.add_argument("--threads",     type=int, default=4)
+    parser.add_argument("--phomt",       action="store_true",
+                        help="Use PhoMT test split instead of the built-in 60-pair set")
+    parser.add_argument("--phomt-split", default="test",
+                        choices=["test", "validation", "train"],
+                        help="PhoMT split to sample from (default: test)")
+    parser.add_argument("--n-samples",   type=int, default=200,
+                        help="Number of PhoMT pairs to sample (default: 200)")
     args = parser.parse_args()
 
-    pairs     = ALL_PAIRS
+    if args.phomt:
+        print(f"Loading PhoMT '{args.phomt_split}' split ({args.n_samples} samples) …")
+        pairs = load_phomt(n_samples=args.n_samples, split=args.phomt_split)
+    else:
+        pairs = ALL_PAIRS
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
     results   = {}
 
@@ -219,7 +230,8 @@ def main():
     print()
 
     # ── ONNX ─────────────────────────────────────────────────────────────────
-    if not args.only_litert and ONNX_FP32.exists() and (ONNX_FP32 / "encoder_model.onnx").exists():
+    if not args.only_litert \
+            and ONNX_FP32.exists() and (ONNX_FP32 / "encoder_model.onnx").exists():
         try:
             print(f"Loading ONNX FP32 from {ONNX_FP32} …")
             enc_o, dec_o, dwp_o = _load_onnx(ONNX_FP32, args.threads)

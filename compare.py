@@ -1,28 +1,24 @@
 """
-Cross-format benchmark: ONNX FP32 vs LiteRT Explicit FP32 vs LiteRT Stateful FP32.
+Cross-format benchmark: ONNX FP32/INT8 vs LiteRT Explicit/Stateful FP32/INT8.
 
-Compares accuracy (BLEU-4, chrF++, exact match) and latency across all export
-formats on the shared 60-pair test set or PhoMT.
+Compares accuracy (BLEU-4, chrF++, exact match, BERTScore, COMET) and latency
+across all export formats on the shared 60-pair test set or PhoMT.
 
 Requirements:
-  - ONNX models exported via onnx/export.py
+  - ONNX models exported via onnx/export.py  (--int8 for INT8)
   - LiteRT explicit models converted via litert/explicit/convert.py
   - LiteRT stateful models converted via litert/stateful/convert.py
 
 Each track uses a separate venv with incompatible deps.  Run subsets separately:
   --only-onnx / --only-litert
 
-Alternatively: activate one venv and install the other runtimes manually, e.g.:
-  source litert/explicit/.venv/bin/activate
-  pip install onnxruntime
-
 Usage:
   python compare.py
   python compare.py --only-onnx
   python compare.py --only-litert
   python compare.py --verbose
-  python compare.py --phomt
   python compare.py --phomt --n-samples 500
+  python compare.py --phomt --bertscore --comet
 """
 
 import argparse
@@ -31,6 +27,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -41,6 +38,7 @@ from shared.metrics import compute_metrics_split, print_results_table
 MODEL_DIR = Path(__file__).parent.parent / "translation" / "model_pt"
 OUT_DIR   = Path(__file__).parent / "litert" / "output"
 ONNX_FP32 = Path(__file__).parent / "onnx" / "output" / "fp32"
+ONNX_INT8 = Path(__file__).parent / "onnx" / "output" / "int8"
 
 SEQ_LEN  = 128
 N_HEADS  = 8
@@ -52,16 +50,16 @@ PAD_ID   = 0
 
 # ── Input helpers ─────────────────────────────────────────────────────────────
 
-def make_litert_inputs(tokenizer, text: str, task_id: int):
+def make_litert_inputs(tokenizer, text: str, task_id: int, seq_len: int = SEQ_LEN):
     ids = [task_id] + tokenizer.encode(text, add_special_tokens=False)
     if ids[-1] != EOS_ID:
         ids.append(EOS_ID)
-    real = min(len(ids), SEQ_LEN)
-    input_ids = np.zeros((1, SEQ_LEN), dtype=np.int32)
+    real = min(len(ids), seq_len)
+    input_ids = np.zeros((1, seq_len), dtype=np.int32)
     input_ids[0, :real] = ids[:real]
-    pad_mask = np.zeros(SEQ_LEN, dtype=np.float32)
+    pad_mask = np.zeros(seq_len, dtype=np.float32)
     pad_mask[real:] = float("-inf")
-    return input_ids, np.arange(SEQ_LEN, dtype=np.int32), pad_mask
+    return input_ids, np.arange(seq_len, dtype=np.int32), pad_mask
 
 
 def make_onnx_inputs(tokenizer, text: str, task_id: int):
@@ -125,15 +123,16 @@ def decode_stateful(enc_runner, dec_model_path: str,
 
 # ── ONNX loader + inference ───────────────────────────────────────────────────
 
-def _load_onnx(onnx_dir: Path, num_threads: int = 4):
+def _load_onnx(onnx_dir: Path, num_threads: int = 4, quantized: bool = False):
     import onnxruntime as ort
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opts.inter_op_num_threads = num_threads
     opts.intra_op_num_threads = num_threads
-    enc = ort.InferenceSession(str(onnx_dir / "encoder_model.onnx"),          opts)
-    dec = ort.InferenceSession(str(onnx_dir / "decoder_model.onnx"),           opts)
-    dwp = ort.InferenceSession(str(onnx_dir / "decoder_with_past_model.onnx"), opts)
+    sfx = "_quantized" if quantized else ""
+    enc = ort.InferenceSession(str(onnx_dir / f"encoder_model{sfx}.onnx"),          opts)
+    dec = ort.InferenceSession(str(onnx_dir / f"decoder_model{sfx}.onnx"),           opts)
+    dwp = ort.InferenceSession(str(onnx_dir / f"decoder_with_past_model{sfx}.onnx"), opts)
     return enc, dec, dwp
 
 
@@ -176,15 +175,20 @@ def decode_onnx(enc_sess, dec_sess, dwp_sess, tokenizer,
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_model(name: str, translate_fn, tokenizer,
-              pairs: list, verbose: bool) -> dict:
-    print(f"  [{name}] …")
+              pairs: list, verbose: bool,
+              comet_model=None, use_bertscore: bool = False) -> dict:
     t0   = time.perf_counter()
-    hyps = [translate_fn(tokenizer, src, task_id) for task_id, src, _ in pairs]
+    hyps = [
+        translate_fn(tokenizer, src, task_id)
+        for task_id, src, _ in tqdm(pairs, desc=f"  {name}", ncols=80, unit="sent")
+    ]
     elapsed = time.perf_counter() - t0
 
     refs     = [r for _, _, r in pairs]
     task_ids = [t for t, _, _  in pairs]
-    metrics  = compute_metrics_split(hyps, refs, task_ids)
+    sources  = [s for _, s, _  in pairs] if (comet_model is not None) else None
+    metrics  = compute_metrics_split(hyps, refs, task_ids, sources,
+                                     comet_model, use_bertscore)
     metrics["elapsed_s"]   = round(elapsed, 1)
     metrics["ms_per_sent"] = round(elapsed * 1000 / len(pairs), 1)
 
@@ -214,6 +218,10 @@ def main():
                         help="PhoMT split to sample from (default: test)")
     parser.add_argument("--n-samples",   type=int, default=200,
                         help="Number of PhoMT pairs to sample (default: 200)")
+    parser.add_argument("--bertscore",   action="store_true",
+                        help="Compute BERTScore F1 (requires bert-score)")
+    parser.add_argument("--comet",       action="store_true",
+                        help="Compute COMET score (requires unbabel-comet)")
     args = parser.parse_args()
 
     if args.phomt:
@@ -229,22 +237,48 @@ def main():
           f"VI→EN: {sum(1 for t,_,_ in pairs if t==TASK_VI_EN)})")
     print()
 
-    # ── ONNX ─────────────────────────────────────────────────────────────────
+    # ── Load optional models once ─────────────────────────────────────────────
+    comet_model = None
+    if args.comet:
+        print("Loading COMET model (Unbabel/wmt22-comet-da) …")
+        from comet import download_model, load_from_checkpoint
+        comet_model = load_from_checkpoint(download_model("Unbabel/wmt22-comet-da"))
+        print()
+
+    run_kwargs = dict(verbose=args.verbose, comet_model=comet_model,
+                      use_bertscore=args.bertscore)
+
+    # ── ONNX FP32 ─────────────────────────────────────────────────────────────
     if not args.only_litert \
             and ONNX_FP32.exists() and (ONNX_FP32 / "encoder_model.onnx").exists():
         try:
-            print(f"Loading ONNX FP32 from {ONNX_FP32} …")
             enc_o, dec_o, dwp_o = _load_onnx(ONNX_FP32, args.threads)
+        except ImportError:
+            print("  [skip] onnxruntime not installed — pip install onnxruntime")
+        else:
+            print(f"Loading ONNX FP32 …")
             results["ONNX FP32"] = run_model(
                 "ONNX FP32",
                 lambda tok, src, tid: decode_onnx(enc_o, dec_o, dwp_o, tok, src, tid),
-                tokenizer, pairs, args.verbose,
+                tokenizer, pairs, **run_kwargs,
             )
-        except ImportError:
-            print("  [skip] onnxruntime not installed in this env")
-            print("         pip install onnxruntime")
 
-    # ── LiteRT Explicit ───────────────────────────────────────────────────────
+    # ── ONNX INT8 ─────────────────────────────────────────────────────────────
+    if not args.only_litert \
+            and ONNX_INT8.exists() and (ONNX_INT8 / "encoder_model_quantized.onnx").exists():
+        try:
+            enc_o8, dec_o8, dwp_o8 = _load_onnx(ONNX_INT8, args.threads, quantized=True)
+        except ImportError:
+            print("  [skip] onnxruntime not installed — pip install onnxruntime")
+        else:
+            print(f"Loading ONNX INT8 …")
+            results["ONNX INT8"] = run_model(
+                "ONNX INT8",
+                lambda tok, src, tid: decode_onnx(enc_o8, dec_o8, dwp_o8, tok, src, tid),
+                tokenizer, pairs, **run_kwargs,
+            )
+
+    # ── LiteRT Explicit FP32 ──────────────────────────────────────────────────
     explicit_fp32 = OUT_DIR / "t5_mini_explicit_fp32.tflite"
     if not args.only_onnx and explicit_fp32.exists():
         print(f"Loading LiteRT Explicit FP32 …")
@@ -253,26 +287,49 @@ def main():
         results["LiteRT Explicit FP32"] = run_model(
             "LiteRT Explicit FP32",
             lambda tok, src, tid: decode_explicit(er, dr, tok, src, tid),
-            tokenizer, pairs, args.verbose,
+            tokenizer, pairs, **run_kwargs,
         )
 
-    # ── LiteRT Stateful ───────────────────────────────────────────────────────
-    stat_enc = OUT_DIR / "t5_mini_stateful_enc_fp32.tflite"
-    stat_dec = OUT_DIR / "t5_mini_stateful_dec_fp32.tflite"
-    if not args.only_onnx and stat_enc.exists() and stat_dec.exists():
+    # ── LiteRT Explicit INT8 ──────────────────────────────────────────────────
+    explicit_int8 = OUT_DIR / "t5_mini_explicit_int8.tflite"
+    if not args.only_onnx and explicit_int8.exists():
+        print(f"Loading LiteRT Explicit INT8 …")
+        interp8 = _load_litert(str(explicit_int8))
+        er8, dr8 = interp8.get_signature_runner("encode"), interp8.get_signature_runner("decode")
+        results["LiteRT Explicit INT8"] = run_model(
+            "LiteRT Explicit INT8",
+            lambda tok, src, tid: decode_explicit(er8, dr8, tok, src, tid),
+            tokenizer, pairs, **run_kwargs,
+        )
+
+    # ── LiteRT Stateful FP32 ──────────────────────────────────────────────────
+    stat_enc      = OUT_DIR / "t5_mini_stateful_enc_fp32.tflite"
+    stat_dec_fp32 = OUT_DIR / "t5_mini_stateful_dec_fp32.tflite"
+    if not args.only_onnx and stat_enc.exists() and stat_dec_fp32.exists():
         print(f"Loading LiteRT Stateful FP32 …")
         enc_runner = _load_litert(str(stat_enc)).get_signature_runner("encode")
         results["LiteRT Stateful FP32"] = run_model(
             "LiteRT Stateful FP32",
-            lambda tok, src, tid: decode_stateful(enc_runner, str(stat_dec), tok, src, tid),
-            tokenizer, pairs, args.verbose,
+            lambda tok, src, tid: decode_stateful(enc_runner, str(stat_dec_fp32), tok, src, tid),
+            tokenizer, pairs, **run_kwargs,
+        )
+
+    # ── LiteRT Stateful INT8 (FP32 encoder + INT8 decoder) ───────────────────
+    stat_dec_int8 = OUT_DIR / "t5_mini_stateful_dec_int8.tflite"
+    if not args.only_onnx and stat_enc.exists() and stat_dec_int8.exists():
+        print(f"Loading LiteRT Stateful INT8 …")
+        enc_runner_s = _load_litert(str(stat_enc)).get_signature_runner("encode")
+        results["LiteRT Stateful INT8"] = run_model(
+            "LiteRT Stateful INT8",
+            lambda tok, src, tid: decode_stateful(enc_runner_s, str(stat_dec_int8), tok, src, tid),
+            tokenizer, pairs, **run_kwargs,
         )
 
     if not results:
         print("No models found. Run the export/convert scripts first.")
         return
 
-    print_results_table(results, title="CROSS-FORMAT COMPARISON")
+    print_results_table(results, title="CROSS-FORMAT COMPARISON", test_pairs=pairs)
 
 
 if __name__ == "__main__":

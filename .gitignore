@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Model outputs
+litert/output/
+onnx/output/
+executorch/output/
+
+# HuggingFace cache
+*.arrow
+*.lock
+
+# Misc
+.DS_Store

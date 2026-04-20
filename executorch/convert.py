@@ -17,7 +17,8 @@ Method signatures in the produced model.pte:
 
   text_decoder(decoder_input_ids: int64[1, 1],
                encoder_hidden_states: float32[1, seq_len, 384],
-               cache_position: int64[1])
+               cache_position: int64[1],
+               encoder_attention_mask: int64[1, seq_len])
       → lm_logits: float32[1, 1, vocab_size]
 
   sampler(logits: float32[1, 1, vocab_size])
@@ -44,7 +45,7 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_DIR = Path(__file__).parents[2] / "translation" / "model_pt"
 OUT_DIR   = Path(__file__).parent / "output"
-SEQ_LEN   = 512   # encoder and decoder sequence length (static; inputs are padded to this)
+SEQ_LEN   = 128   # encoder and decoder sequence length (static; inputs are padded to this)
 
 
 # ── Static-shape exportable module ───────────────────────────────────────────
@@ -70,12 +71,60 @@ def _make_exportable(model, seq_len: int):
     d_model = model.config.d_model
     device  = model.device
 
+
     class T5StaticExportableModule(Seq2SeqLMExportableModule):
+        def _export_encoder(self, encoder_input_ids):
+            # Wrap the encoder so it computes attention_mask = (input_ids != 0)
+            # internally. Without this, the encoder attends to PAD tokens (id=0)
+            # used for static padding, corrupting hidden states at real positions.
+            # transformers 5.0 made attention_mask keyword-only in T5Stack.forward,
+            # so we call it with kwargs and return last_hidden_state directly.
+            enc = self.encoder
+            enc_device = self.model.device
+
+            class _EncoderWithMask(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._enc = enc
+
+                def forward(self, input_ids):
+                    attention_mask = (input_ids != 0).long()
+                    hidden = self._enc(
+                        input_ids=input_ids, attention_mask=attention_mask
+                    ).last_hidden_state
+                    # Zero out PAD positions so decoder cross-attention ignores them,
+                    # matching the behaviour of HF encoder which only outputs real tokens.
+                    return hidden * attention_mask.unsqueeze(-1).float()
+
+            wrapped = _EncoderWithMask().to(enc_device).eval()
+            seq_len_dim = torch.export.Dim("encoder_seq_len", max=seq_len)
+            with torch.no_grad():
+                return torch.export.export(
+                    wrapped,
+                    (encoder_input_ids,),
+                    dynamic_shapes={"input_ids": {1: seq_len_dim}},
+                    strict=True,
+                )
+
         def _export_decoder(self, decoder_input_ids, encoder_hidden_states, cache_position):
-            # Build a fresh wrapper each time so the static-cache init sees the
-            # correct max lengths.
+            # Subclass to inject encoder_attention_mask into the decoder call so
+            # T5's relative position bias is computed for actual encoder length,
+            # not the full padded SEQ_LEN.
+            class _T5DecoderWithEncoderMask(Seq2SeqLMDecoderExportableModuleWithStaticCache):
+                def forward(self, decoder_input_ids, encoder_hidden_states,
+                            cache_position, encoder_attention_mask):
+                    outputs = self.decoder(
+                        input_ids=decoder_input_ids,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        past_key_values=self.cache,
+                        use_cache=True,
+                        cache_position=cache_position,
+                    )
+                    return self.lm_head(outputs[0])
+
             wrapped = (
-                Seq2SeqLMDecoderExportableModuleWithStaticCache(
+                _T5DecoderWithEncoderMask(
                     model=self.model,
                     max_static_cache_length=seq_len,
                     batch_size=1,
@@ -83,17 +132,16 @@ def _make_exportable(model, seq_len: int):
                 .to(device)
                 .eval()
             )
-            # Use a fixed-size example matching SEQ_LEN on all dims.
-            # No dynamic shapes: encoder hidden states are always (1, SEQ_LEN, d_model).
-            example_dec_ids = torch.tensor([[0]], dtype=torch.long, device=device)
-            example_enc_hs  = torch.zeros((1, seq_len, d_model), dtype=torch.float32, device=device)
-            example_cache   = torch.tensor([0], dtype=torch.long, device=device)
+            example_dec_ids  = torch.tensor([[0]], dtype=torch.long, device=device)
+            example_enc_hs   = torch.zeros((1, seq_len, d_model), dtype=torch.float32, device=device)
+            example_cache    = torch.tensor([0], dtype=torch.long, device=device)
+            example_enc_mask = torch.ones((1, seq_len), dtype=torch.long, device=device)
             with torch.nn.attention.sdpa_kernel(
                 [torch.nn.attention.SDPBackend.MATH]
             ), torch.no_grad():
                 return torch.export.export(
                     wrapped,
-                    (example_dec_ids, example_enc_hs, example_cache),
+                    (example_dec_ids, example_enc_hs, example_cache, example_enc_mask),
                     dynamic_shapes=None,   # fully static — avoids cross-attn mask conflict
                     strict=True,
                 )

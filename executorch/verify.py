@@ -7,7 +7,8 @@ The model.pte produced by convert.py exposes three methods:
 
   text_decoder(decoder_input_ids: int64[1, 1],
                encoder_hidden_states: float32[1, seq_len, 384],
-               cache_position: int64[1])
+               cache_position: int64[1],
+               encoder_attention_mask: int64[1, seq_len])
       → lm_logits: float32[1, 1, vocab_size]
 
   sampler(logits: float32[1, 1, vocab_size]) → next_token: int64[1]
@@ -35,7 +36,7 @@ from transformers import T5ForConditionalGeneration, AutoTokenizer
 MODEL_DIR  = Path(__file__).parents[2] / "translation" / "model_pt"
 OUT_DIR    = Path(__file__).parent / "output"
 
-SEQ_LEN        = 512
+SEQ_LEN        = 128
 MAX_NEW_TOKENS = 64
 
 TASK_EN_VI = 20000
@@ -103,8 +104,11 @@ def et_translate(pte_module, tokenizer, text: str, task_id: int,
                  max_new_tokens: int = MAX_NEW_TOKENS) -> str:
     input_ids = build_encoder_input(tokenizer, text, task_id)
 
+    # Build encoder attention mask: 1 at real token positions, 0 at PAD
+    enc_mask = (input_ids != PAD_ID).long()   # int64[1, SEQ_LEN]
+
     # Encode
-    enc_out           = pte_module.run_method("encoder", (input_ids,))
+    enc_out               = pte_module.run_method("encoder", (input_ids,))
     encoder_hidden_states = enc_out[0]   # float32[1, SEQ_LEN, d_model]
 
     # Decode — cache_position=0 resets the static KV cache for this sentence
@@ -117,6 +121,7 @@ def et_translate(pte_module, tokenizer, text: str, task_id: int,
                 torch.tensor([[token_id]], dtype=torch.long),
                 encoder_hidden_states,
                 torch.tensor([step], dtype=torch.long),
+                enc_mask,
             ),
         )
         logits   = dec_out[0]  # float32[1, 1, vocab_size]
@@ -133,6 +138,7 @@ def et_translate(pte_module, tokenizer, text: str, task_id: int,
 
 def benchmark(pte_module, tokenizer, n_runs: int = 20):
     input_ids = build_encoder_input(tokenizer, "Hello, how are you?", TASK_EN_VI)
+    enc_mask  = (input_ids != PAD_ID).long()
 
     # Warm-up
     for _ in range(3):
@@ -140,7 +146,7 @@ def benchmark(pte_module, tokenizer, n_runs: int = 20):
         hs = enc_out[0]
         pte_module.run_method(
             "text_decoder",
-            (torch.tensor([[0]], dtype=torch.long), hs, torch.tensor([0], dtype=torch.long)),
+            (torch.tensor([[0]], dtype=torch.long), hs, torch.tensor([0], dtype=torch.long), enc_mask),
         )
 
     # Encoder latency
@@ -153,7 +159,7 @@ def benchmark(pte_module, tokenizer, n_runs: int = 20):
     # Decoder latency — steady-state per-step cost (step > 0 to use cached state)
     pte_module.run_method(
         "text_decoder",
-        (torch.tensor([[0]], dtype=torch.long), hs, torch.tensor([0], dtype=torch.long)),
+        (torch.tensor([[0]], dtype=torch.long), hs, torch.tensor([0], dtype=torch.long), enc_mask),
     )
     t0 = time.perf_counter()
     for s in range(1, n_runs + 1):
@@ -163,6 +169,7 @@ def benchmark(pte_module, tokenizer, n_runs: int = 20):
                 torch.tensor([[0]], dtype=torch.long),
                 hs,
                 torch.tensor([s % SEQ_LEN], dtype=torch.long),
+                enc_mask,
             ),
         )
     dec_ms = (time.perf_counter() - t0) * 1000 / n_runs
